@@ -108,9 +108,23 @@ _Avoid_: palette, color scheme
 The Web Audio routing architecture where each object category owns a frequency band (hazards low, value high, relief mid), enforced by per-category `BiquadFilterNode` chains.
 _Avoid_: audio mixer, sound system
 
+### Persistence & Progression
+
+**SaveManager**:
+The client-side persistence layer that reads/writes a single JSON blob to `localStorage`. Contains best stats (per-mode), Field Guide progress, cosmetic unlocks, and player UUID. Writes are triggered by SimEvent reactions in the client layer, never inside the Simulation Core.
+_Avoid_: save system, save file, database
+
+**Field Guide**:
+A cross-session collection journal tracking which Reject types the player has survived a Near-Miss against. Visible in-game as a grid screen. Progress is per-EntityType boolean flags stored in the SaveManager.
+_Avoid_: bestiary, codex, encyclopedia
+
+**Near-Miss**:
+A proximity event where the player enters a hazard's expanded detection zone and exits alive without contacting the lethal hitbox. The trigger for Field Guide discovery. Concrete margin size is a tuning parameter.
+_Avoid_: close call, dodge
+
 ## Relationships
 
-- The **Spawn Director** pre-rolls a complete timeline of **Rejects** using 5 PRNG sub-streams (timing, type, placement, chaos, cosmetic) before the session starts
+- The **Spawn Director** pre-rolls a complete timeline of **Rejects** using 4 PRNG sub-streams (type, placement, chaos, cosmetic) before the session starts
 - Each **Reject** spawns during one of five **Phases**, which control cadence and category bias
 - The **Solvability Veto** validates every permanent **Reject** placement before it commits
 - **Time Tokens** edit the master clock but cannot open the **SHIP IT Door** before 4:00
@@ -121,6 +135,8 @@ _Avoid_: audio mixer, sound system
 - The **Spawn Director** produces the **Generation Output** once from a seed; the **Simulation Core** reads it as immutable input every tick alongside mutable **GameState**
 - **Replay Verification** hashes **GameState** only — never **Generation Output** (regenerated from seed) and never derived values
 - **Golden Replays** snapshot **GameState** at specific ticks; **Generation Output** is regenerated, not snapshotted
+- The **SaveManager** persists to `localStorage` in the client layer, triggered by `SimEvent` reactions — never writes from inside the **Simulation Core**
+- The **Field Guide** tracks per-Reject-type **Near-Miss** flags across sessions via the **SaveManager**
 
 ## Example dialogue
 

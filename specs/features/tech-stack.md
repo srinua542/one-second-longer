@@ -30,8 +30,8 @@ packages/
 |---|---|
 | Algorithm | SFC32 (inlined, no dependency) |
 | String-seed hashing | FNV-1a |
-| Sub-streams | 5: timing, type, placement, chaos, cosmetic |
-| Consumption model | All streams consumed at generation time except cosmetic (runtime-only) |
+| Sub-streams | 4: type, placement, chaos, cosmetic (timing stream removed — spawn timing is fully deterministic from the ramped interval curve, zero RNG) |
+| Consumption model | Type/placement consumed at generation time; chaos consumed at generation time for chaotic-spawn entity properties (Mystery Crate contents, Gacha Door destinations, Weather Vane effects, Dice faces, tie-breaks); cosmetic consumed at runtime only |
 | Schedule model | Pre-roll all outcomes (ADR-0005) |
 
 ### Rendering

@@ -318,16 +318,19 @@ interface GameState {
   entities: Entity[];
   scheduleCursor: number;
   phase: PhaseState;
-  score: number;
+  score: number;                               // accumulated bits banked via Piggy Bank
   deaths: number;
   antiIdleWindow: number[];           // fixed-size ring buffer
   deathLog: DeathEvent[];             // capped to what mechanics consume
   avoidanceLog: AvoidanceEvent[];     // capped to what mechanics consume
   coffeeBreak: { active: boolean; ticksRemaining: number };
   powerUpTimers: Record<string, number>;
-  timeTokenTally: number;
+  timeTokenTally: number;                      // net seconds edited; clamped so clock cannot fall below 4:00 (14,400 ticks)
   souvenirCrownKills: Record<string, number>;
   recentDeathCounter: number;         // raw fact, not the derived boolean
+  monumentsErected: number;           // cumulative count, never decremented — monuments are permanent entities
+                                      // but counting via entities.filter() at run-end risks missing
+                                      // any that were somehow removed; this counter is authoritative
 }
 
 // Derived — pure functions, never stored, never hashed
@@ -422,7 +425,8 @@ function step(state: GameState, run: GeneratedRun, input: Input, dt: number, eve
   //    If threshold crossed: run solvability veto, spawn Monument if it passes.
   //    Placed AFTER hazard collision (step 5) so a freshly-spawned Monument does NOT
   //    retroactively hit the player the same tick it appears — one-tick grace window.
-  //    (Pending GDD confirmation on intended feel; defaulting to grace.)
+  //    This is a locked design decision, not pending: Monuments are warnings/consequences
+  //    ("a statue of you, where you stood"), not instant unavoidable damage.
   updateAntiIdle(state, pendingRemovals, events);
 
   // 8. Score/tally updates, derived from this tick's collision/pickup events.
@@ -443,7 +447,7 @@ function step(state: GameState, run: GeneratedRun, input: Input, dt: number, eve
 
 **Log-read-timing rule:** Systems that read death/avoidance logs to gate their own behavior (Complaint Form, Regifter, Understudy) must read the log as of **tick-start** — this tick's own collision-appended entries are not visible to them until the next tick. This prevents same-tick-reaction hazards identical to the Monument case. Structurally, this is already achieved by the ordering above: log-reading behavior in `updateEnemies` (step 4) runs before collision checks that append to the logs (steps 5–6).
 
-**Same-tick Monument lethality (open design question):** The default ordering gives a one-tick grace window — the Monument spawns in step 7, after hazard collision ran in step 5, so the player has one tick to react before collision fires against it next tick. This matches the GDD's framing of Monuments as warnings/consequences ("a statue of you, where you stood") rather than instant unavoidable damage. Pending explicit GDD confirmation; if the GDD intends instant punishment, move Monument-spawn before step 5.
+**Same-tick Monument lethality (locked decision):** The ordering gives a one-tick grace window — the Monument spawns in step 7, after hazard collision ran in step 5, so the player has one tick to react before collision fires against it next tick. This matches the GDD's framing of Monuments as warnings/consequences ("a statue of you, where you stood") rather than instant unavoidable damage. The GDD's anti-idle escalation ladder explicitly says the player is "shoved sideways (small knockback), **not killed**" — the Monument punishes the *spot*, not the player, which is incoherent with instant lethality on the spawn tick.
 
 ## Physics (deterministic core)
 
@@ -539,6 +543,7 @@ function trySpawnMonument(
   }
 
   spawnEntity(state, candidate, events);
+  state.monumentsErected++;  // co-located with spawn — same function, same code path, cannot drift
 }
 ```
 
@@ -613,5 +618,62 @@ simulation.step(state, run, input, dt, events?) → void (mutates state, pushes 
 - [docs/adr/0005-pre-roll-all-outcomes.md](../../docs/adr/0005-pre-roll-all-outcomes.md)
 - [docs/adr/0006-replay-verification.md](../../docs/adr/0006-replay-verification.md)
 - [docs/adr/0008-canonical-state-vs-generation-output-vs-derived.md](../../docs/adr/0008-canonical-state-vs-generation-output-vs-derived.md)
+
+## Determinism risk register
+
+Consolidated list of every known source of client/server divergence risk. Each risk has a mitigation and a test obligation. This is the first thing to validate — not something to discover via a leaderboard rejection in production.
+
+### Floating-point risks
+
+| Risk | Scope | Mitigation | Test |
+|---|---|---|---|
+| FP operation order in physics | Runtime | Fixed integration order (velocity → X → Y → triggers), documented as named rule | Byte-for-byte `GameState` comparison: same seed + input on Node vs. browser V8 |
+| `Math.cos` in phase-ramp easing | Generation | Client and server both run V8 (same engine, same IEEE 754 implementation) | Golden-replay fixture at each phase boundary verifies bit-identical schedule |
+| FP accumulation in `lerp`/interval calculation | Generation | Single-sample computation (no iterative accumulation) | Same-seed schedule comparison across 100 seeds |
+| Coyote timer tick rounding (5.4 ticks → 5 or 6) | Runtime | Explicit constant (`COYOTE_TIME_TICKS`), not computed at runtime | Golden-replay fixture with coyote-edge-case jump |
+
+### Iteration order risks
+
+| Risk | Scope | Mitigation | Test |
+|---|---|---|---|
+| `Set` iteration order for `pendingRemovals` | Runtime | Set is tick-scoped and only tested via `has()` — iteration order is never consumed. Final `filter()` uses array order, not Set order. | Stress-test fixture: 10+ entities removed in one tick, verify final `entities[]` order matches expectation |
+| `Record<string, number>` key order (`powerUpTimers`, `souvenirCrownKills`) | Runtime | Values accessed by explicit key, never iterated for deterministic output | If any future code iterates these records, add explicit sort — flag in code review |
+| `Array.prototype.sort` stability | Runtime | No sorts used in `simulation/`. If added, must use a stable comparator with a deterministic tie-break. | Lint rule: flag any `.sort()` call inside `simulation/` for manual review |
+
+### PRNG consumption risks
+
+| Risk | Scope | Mitigation | Test |
+|---|---|---|---|
+| Variable placement stream consumption | Generation | Capped at `PLACEMENT_MAX_REDRAWS = 10` with deterministic fallback | Same-seed schedule identity verified across runs |
+| Guarantee override skipping type-stream draws | Generation | Named rule: both draws skipped (zero consumption), per-type independent tracking | Fixture exercising guarantee at slot where type draw would otherwise fire |
+| Conditional chaos-stream draws (type-dependent) | Generation | Draw count per type is fixed and documented in stream map | Schedule identity across 100 seeds |
+
+### Prohibited operations in `simulation/`
+
+These must never appear in any file under `packages/simulation/`. Enforced by tsconfig path restrictions + lint rules:
+
+| Prohibited | Why | Alternative |
+|---|---|---|
+| `Math.random()` | Non-deterministic | Seeded SFC32 PRNG |
+| `crypto.randomUUID()` / `crypto.getRandomValues()` | Non-deterministic | `GameState.nextEntityId` counter |
+| `Date.now()` / `performance.now()` / `new Date()` | Wall-clock dependency | `GameState.tick` |
+| `setTimeout` / `setInterval` / `requestAnimationFrame` | Async timing dependency | Tick-based scheduling |
+| `JSON.stringify()` for state comparison | Property order not guaranteed | `structuredClone()` + field-by-field comparison |
+| `Array.prototype.sort()` without explicit review | Stability not guaranteed across engines | Documented stable sort with deterministic tie-break |
+
+### Refactor danger zones
+
+Changes in these areas silently break determinism if done without golden-replay validation:
+
+1. Reorder physics integration steps (FP divergence)
+2. Reorder jump timer/attempt/flag sequence
+3. Change entity removal from deferred to mid-iteration
+4. Reorder `step()` system-function calls
+5. Add derived flags to `GameState` (two-source-of-truth)
+6. Change PRNG stream draw order or count
+7. Add trig/transcendental functions to physics hot path
+8. Add `Set`/`Map` iteration where output order matters
+9. Include schedule or cosmetic RNG in replay hash
+10. Cache `isAlive()` results across system passes within one tick
 - [docs/adr/0009-ephemeral-event-channel.md](../../docs/adr/0009-ephemeral-event-channel.md)
 - [docs/adr/0007-arcade-physics-cosmetic-only.md](../../docs/adr/0007-arcade-physics-cosmetic-only.md)
